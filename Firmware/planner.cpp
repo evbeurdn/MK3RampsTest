@@ -63,6 +63,10 @@
 #include "mesh_bed_calibration.h"
 #endif
 
+#ifdef TMC2130
+#include "tmc2130.h"
+#endif //TMC2130
+
 //===========================================================================
 //=============================public variables ============================
 //===========================================================================
@@ -124,6 +128,12 @@ float extrude_min_temp=EXTRUDE_MINTEMP;
 
 #ifdef FILAMENT_SENSOR
  static char meas_sample; //temporary variable to hold filament measurement sample
+#endif
+
+#ifdef LIN_ADVANCE
+    float extruder_advance_k = LIN_ADVANCE_K,
+    advance_ed_ratio = LIN_ADVANCE_E_D_RATIO,
+    position_float[NUM_AXIS] = { 0 };
 #endif
 
 // Returns the index of the next block in the ring buffer
@@ -254,6 +264,10 @@ void calculate_trapezoid_for_block(block_t *block, float entry_speed, float exit
   }
 
   CRITICAL_SECTION_START;  // Fill variables used by the stepper in a critical section
+  // This block locks the interrupts globally for 4.38 us,
+  // which corresponds to a maximum repeat frequency of 228.57 kHz.
+  // This blocking is safe in the context of a 10kHz stepper driver interrupt
+  // or a 115200 Bd serial line receive interrupt, which will not trigger faster than 12kHz.
   if (! block->busy) { // Don't update variables if block is busy.
     block->accelerate_until = accelerate_steps;
     block->decelerate_after = accelerate_steps+plateau_steps;
@@ -411,6 +425,9 @@ void plan_init() {
   block_buffer_head = 0;
   block_buffer_tail = 0;
   memset(position, 0, sizeof(position)); // clear position
+#ifdef LIN_ADVANCE
+  memset(position_float, 0, sizeof(position)); // clear position
+#endif
   previous_speed[0] = 0.0;
   previous_speed[1] = 0.0;
   previous_speed[2] = 0.0;
@@ -543,10 +560,12 @@ static inline void planner_update_queue_min_counter()
 }
 #endif /* PLANNER_DIAGNOSTICS */
 
+extern volatile uint32_t step_events_completed; // The number of step events executed in the current block
+
 void planner_abort_hard()
 {
     // Abort the stepper routine and flush the planner queue.
-    quickStop();
+    DISABLE_STEPPER_DRIVER_INTERRUPT();
 
     // Now the front-end (the Marlin_main.cpp with its current_position) is out of sync.
     // First update the planner's current position in the physical motor steps.
@@ -562,9 +581,39 @@ void planner_abort_hard()
     current_position[E_AXIS] = st_get_position_mm(E_AXIS);
     // Apply the mesh bed leveling correction to the Z axis.
 #ifdef MESH_BED_LEVELING
-    if (mbl.active)
+    if (mbl.active) {
+#if 1
+        // Undo the bed level correction so the current Z position is reversible wrt. the machine coordinates.
+        // This does not necessary mean that the Z position will be the same as linearly interpolated from the source G-code line.
         current_position[Z_AXIS] -= mbl.get_z(current_position[X_AXIS], current_position[Y_AXIS]);
+#else
+        // Undo the bed level correction so that the current Z position is the same as linearly interpolated from the source G-code line.
+        if (current_block == NULL || (current_block->steps_x == 0 && current_block->steps_y == 0))
+            current_position[Z_AXIS] -= mbl.get_z(current_position[X_AXIS], current_position[Y_AXIS]);
+        else {
+            float t = float(step_events_completed) / float(current_block->step_event_count);
+            float vec[3] = { 
+              current_block->steps_x / axis_steps_per_unit[X_AXIS],
+              current_block->steps_y / axis_steps_per_unit[Y_AXIS],
+              current_block->steps_z / axis_steps_per_unit[Z_AXIS]
+            };
+            float pos1[3], pos2[3];
+            for (int8_t i = 0; i < 3; ++ i) {
+              if (current_block->direction_bits & (1<<i))
+                vec[i] = - vec[i];
+              pos1[i] = current_position[i] - vec[i] * t;
+              pos2[i] = current_position[i] + vec[i] * (1.f - t);
+            }
+            pos1[Z_AXIS] -= mbl.get_z(pos1[X_AXIS], pos1[Y_AXIS]);
+            pos2[Z_AXIS] -= mbl.get_z(pos2[X_AXIS], pos2[Y_AXIS]);
+            current_position[Z_AXIS] = pos1[Z_AXIS] * t + pos2[Z_AXIS] * (1.f - t);
+        }
 #endif
+    }
+#endif
+    // Clear the planner queue, reset and re-enable the stepper timer.
+    quickStop();
+
     // Apply inverse world correction matrix.
     machine2world(current_position[X_AXIS], current_position[Y_AXIS]);
     memcpy(destination, current_position, sizeof(destination));
@@ -676,12 +725,22 @@ void plan_buffer_line(float x, float y, float z, const float &e, float feed_rate
     target[Z_AXIS] = lround(z*axis_steps_per_unit[Z_AXIS]);
 #endif // ENABLE_MESH_BED_LEVELING
   target[E_AXIS] = lround(e*axis_steps_per_unit[E_AXIS]);
+  
+#ifdef LIN_ADVANCE
+    const float mm_D_float = sqrt(sq(x - position_float[X_AXIS]) + sq(y - position_float[Y_AXIS]));
+    float de_float = e - position_float[E_AXIS];
+#endif
+    
   #ifdef PREVENT_DANGEROUS_EXTRUDE
   if(target[E_AXIS]!=position[E_AXIS])
   {
     if(degHotend(active_extruder)<extrude_min_temp)
     {
       position[E_AXIS]=target[E_AXIS]; //behave as if the move really took place, but ignore E part
+#ifdef LIN_ADVANCE
+      position_float[E_AXIS] = e;
+      de_float = 0;
+#endif
       SERIAL_ECHO_START;
       SERIAL_ECHOLNRPGM(MSG_ERR_COLD_EXTRUDE_STOP);
     }
@@ -690,6 +749,10 @@ void plan_buffer_line(float x, float y, float z, const float &e, float feed_rate
     if(labs(target[E_AXIS]-position[E_AXIS])>axis_steps_per_unit[E_AXIS]*EXTRUDE_MAXLENGTH)
     {
       position[E_AXIS]=target[E_AXIS]; //behave as if the move really took place, but ignore E part
+#ifdef LIN_ADVANCE
+        position_float[E_AXIS] = e;
+        de_float = 0;
+#endif
       SERIAL_ECHO_START;
       SERIAL_ECHOLNRPGM(MSG_ERR_LONG_EXTRUDE_STOP);
     }
@@ -699,6 +762,9 @@ void plan_buffer_line(float x, float y, float z, const float &e, float feed_rate
 
   // Prepare to set up new block
   block_t *block = &block_buffer[block_buffer_head];
+
+  // Set sdlen for calculating sd position
+  block->sdlen = 0;
 
   // Mark block as not busy (Not executed by the stepper interrupt, could be still tinkered with.)
   block->busy = false;
@@ -938,8 +1004,27 @@ Having the real displacement of the head, we can calculate the total movement le
   for(int i=0; i < 4; i++)
   {
     current_speed[i] = delta_mm[i] * inverse_second;
+#ifdef TMC2130
+	float max_fr = max_feedrate[i];
+	if (i < 2) // X, Y
+	{
+		if (tmc2130_mode == TMC2130_MODE_SILENT)
+		{
+			if (max_fr > SILENT_MAX_FEEDRATE)
+				max_fr = SILENT_MAX_FEEDRATE;
+		}
+		else
+		{
+			if (max_fr > NORMAL_MAX_FEEDRATE)
+				max_fr = NORMAL_MAX_FEEDRATE;
+		}
+	}
+    if(fabs(current_speed[i]) > max_fr)
+      speed_factor = min(speed_factor, max_fr / fabs(current_speed[i]));
+#else //TMC2130
     if(fabs(current_speed[i]) > max_feedrate[i])
       speed_factor = min(speed_factor, max_feedrate[i] / fabs(current_speed[i]));
+#endif //TMC2130
   }
 
   // Correct the speed  
@@ -964,6 +1049,43 @@ Having the real displacement of the head, we can calculate the total movement le
   else
   {
     block->acceleration_st = ceil(acceleration * steps_per_mm); // convert to: acceleration steps/sec^2
+#ifdef TMC2130
+#ifdef SIMPLE_ACCEL_LIMIT // in some cases can be acceleration limited inproperly
+	if (tmc2130_mode == TMC2130_MODE_SILENT)
+	{
+		if (block->steps_x || block->steps_y)
+			if (block->acceleration_st > SILENT_MAX_ACCEL_ST) block->acceleration_st = SILENT_MAX_ACCEL_ST;
+	}
+	else
+	{
+		if (block->steps_x || block->steps_y)
+			if (block->acceleration_st > NORMAL_MAX_ACCEL_ST) block->acceleration_st = NORMAL_MAX_ACCEL_ST;
+	}
+	if (block->steps_x && (block->acceleration_st > axis_steps_per_sqr_second[X_AXIS])) block->acceleration_st = axis_steps_per_sqr_second[X_AXIS];
+	if (block->steps_y && (block->acceleration_st > axis_steps_per_sqr_second[Y_AXIS])) block->acceleration_st = axis_steps_per_sqr_second[Y_AXIS];
+	if (block->steps_z && (block->acceleration_st > axis_steps_per_sqr_second[Z_AXIS])) block->acceleration_st = axis_steps_per_sqr_second[Z_AXIS];
+	if (block->steps_e && (block->acceleration_st > axis_steps_per_sqr_second[E_AXIS])) block->acceleration_st = axis_steps_per_sqr_second[E_AXIS];
+#else // SIMPLE_ACCEL_LIMIT
+	if (tmc2130_mode == TMC2130_MODE_SILENT)
+	{
+		if ((block->steps_x > block->step_event_count / 2) || (block->steps_y > block->step_event_count / 2))
+			if (block->acceleration_st > SILENT_MAX_ACCEL_ST) block->acceleration_st = SILENT_MAX_ACCEL_ST;
+	}
+	else
+	{
+		if ((block->steps_x > block->step_event_count / 2) || (block->steps_y > block->step_event_count / 2))
+			if (block->acceleration_st > NORMAL_MAX_ACCEL_ST) block->acceleration_st = NORMAL_MAX_ACCEL_ST;
+	}
+    if(((float)block->acceleration_st * (float)block->steps_x / (float)block->step_event_count) > axis_steps_per_sqr_second[X_AXIS])
+      block->acceleration_st = axis_steps_per_sqr_second[X_AXIS];
+    if(((float)block->acceleration_st * (float)block->steps_y / (float)block->step_event_count) > axis_steps_per_sqr_second[Y_AXIS])
+      block->acceleration_st = axis_steps_per_sqr_second[Y_AXIS];
+    if(((float)block->acceleration_st * (float)block->steps_z / (float)block->step_event_count ) > axis_steps_per_sqr_second[Z_AXIS])
+      block->acceleration_st = axis_steps_per_sqr_second[Z_AXIS];
+    if(((float)block->acceleration_st * (float)block->steps_e / (float)block->step_event_count) > axis_steps_per_sqr_second[E_AXIS])
+      block->acceleration_st = axis_steps_per_sqr_second[E_AXIS];
+#endif // SIMPLE_ACCEL_LIMIT
+#else //TMC2130
     // Limit acceleration per axis
     //FIXME Vojtech: One shall rather limit a projection of the acceleration vector instead of using the limit.
     if(((float)block->acceleration_st * (float)block->steps_x / (float)block->step_event_count) > axis_steps_per_sqr_second[X_AXIS])
@@ -974,11 +1096,12 @@ Having the real displacement of the head, we can calculate the total movement le
       block->acceleration_st = axis_steps_per_sqr_second[E_AXIS];
     if(((float)block->acceleration_st * (float)block->steps_z / (float)block->step_event_count ) > axis_steps_per_sqr_second[Z_AXIS])
       block->acceleration_st = axis_steps_per_sqr_second[Z_AXIS];
+#endif //TMC2130
   }
   // Acceleration of the segment, in mm/sec^2
   block->acceleration = block->acceleration_st / steps_per_mm;
 
-#if 1
+#if 0
   // Oversample diagonal movements by a power of 2 up to 8x
   // to achieve more accurate diagonal movements.
   uint8_t bresenham_oversample = 1;
@@ -1112,6 +1235,37 @@ Having the real displacement of the head, we can calculate the total movement le
   previous_nominal_speed = block->nominal_speed;
   previous_safe_speed = safe_speed;
 
+#ifdef LIN_ADVANCE
+
+    //
+    // Use LIN_ADVANCE for blocks if all these are true:
+    //
+    // esteps                                          : We have E steps todo (a printing move)
+    //
+    // block->steps[X_AXIS] || block->steps[Y_AXIS]    : We have a movement in XY direction (i.e., not retract / prime).
+    //
+    // extruder_advance_k                              : There is an advance factor set.
+    //
+    // block->steps[E_AXIS] != block->step_event_count : A problem occurs if the move before a retract is too small.
+    //                                                   In that case, the retract and move will be executed together.
+    //                                                   This leads to too many advance steps due to a huge e_acceleration.
+    //                                                   The math is good, but we must avoid retract moves with advance!
+    // de_float > 0.0                                  : Extruder is running forward (e.g., for "Wipe while retracting" (Slic3r) or "Combing" (Cura) moves)
+    //
+    block->use_advance_lead =  block->steps_e
+                           && (block->steps_x || block->steps_y)
+                           && extruder_advance_k
+                           && (uint32_t)block->steps_e != block->step_event_count
+                           && de_float > 0.0;
+    if (block->use_advance_lead)
+        block->abs_adv_steps_multiplier8 = lround(
+                          extruder_advance_k
+                          * ((advance_ed_ratio < 0.000001) ? de_float / mm_D_float : advance_ed_ratio) // Use the fixed ratio, if set
+                          * (block->nominal_speed / (float)block->nominal_rate)
+                          * axis_steps_per_unit[E_AXIS] * 256.0
+                          );
+#endif
+    
   // Precalculate the division, so when all the trapezoids in the planner queue get recalculated, the division is not repeated.
   block->speed_factor = block->nominal_rate / block->nominal_speed;
   calculate_trapezoid_for_block(block, block->entry_speed, safe_speed);
@@ -1122,6 +1276,13 @@ Having the real displacement of the head, we can calculate the total movement le
   // Update position
   memcpy(position, target, sizeof(target)); // position[] = target[]
 
+#ifdef LIN_ADVANCE
+  position_float[X_AXIS] = x;
+  position_float[Y_AXIS] = y;
+  position_float[Z_AXIS] = z;
+  position_float[E_AXIS] = e;
+#endif
+    
   // Recalculate the trapezoids to maximize speed at the segment transitions while respecting
   // the machine limits (maximum acceleration and maximum jerk).
   // This runs asynchronously with the stepper interrupt controller, which may
@@ -1135,7 +1296,12 @@ Having the real displacement of the head, we can calculate the total movement le
 #ifdef PLANNER_DIAGNOSTICS
   planner_update_queue_min_counter();
 #endif /* PLANNER_DIAGNOSTIC */
-  st_wake_up();
+
+  // The stepper timer interrupt will run continuously from now on.
+  // If there are no planner blocks to be executed by the stepper routine,
+  // the stepper interrupt ticks at 1kHz to wake up and pick a block
+  // from the planner queue if available.
+  ENABLE_STEPPER_DRIVER_INTERRUPT();
 }
 
 #ifdef ENABLE_AUTO_BED_LEVELING
@@ -1160,6 +1326,7 @@ void plan_set_position(float x, float y, float z, const float &e)
 #endif // ENABLE_AUTO_BED_LEVELING
 
     // Apply the machine correction matrix.
+    if (world2machine_correction_mode != WORLD2MACHINE_CORRECTION_NONE)
     {
         float tmpx = x;
         float tmpy = y;
@@ -1170,15 +1337,19 @@ void plan_set_position(float x, float y, float z, const float &e)
   position[X_AXIS] = lround(x*axis_steps_per_unit[X_AXIS]);
   position[Y_AXIS] = lround(y*axis_steps_per_unit[Y_AXIS]);
 #ifdef MESH_BED_LEVELING
-    if (mbl.active){
-      position[Z_AXIS] = lround((z+mbl.get_z(x, y))*axis_steps_per_unit[Z_AXIS]);
-    }else{
-        position[Z_AXIS] = lround(z*axis_steps_per_unit[Z_AXIS]);
-    }
+  position[Z_AXIS] = mbl.active ? 
+    lround((z+mbl.get_z(x, y))*axis_steps_per_unit[Z_AXIS]) :
+    lround(z*axis_steps_per_unit[Z_AXIS]);
 #else
   position[Z_AXIS] = lround(z*axis_steps_per_unit[Z_AXIS]);
 #endif // ENABLE_MESH_BED_LEVELING
-  position[E_AXIS] = lround(e*axis_steps_per_unit[E_AXIS]);  
+  position[E_AXIS] = lround(e*axis_steps_per_unit[E_AXIS]);
+#ifdef LIN_ADVANCE
+  position_float[X_AXIS] = x;
+  position_float[Y_AXIS] = y;
+  position_float[Z_AXIS] = z;
+  position_float[E_AXIS] = e;
+#endif
   st_set_position(position[X_AXIS], position[Y_AXIS], position[Z_AXIS], position[E_AXIS]);
   previous_nominal_speed = 0.0; // Resets planner junction speeds. Assumes start from rest.
   previous_speed[0] = 0.0;
@@ -1190,12 +1361,18 @@ void plan_set_position(float x, float y, float z, const float &e)
 // Only useful in the bed leveling routine, when the mesh bed leveling is off.
 void plan_set_z_position(const float &z)
 {
+	#ifdef LIN_ADVANCE
+	position_float[Z_AXIS] = z;
+	#endif
     position[Z_AXIS] = lround(z*axis_steps_per_unit[Z_AXIS]);
     st_set_position(position[X_AXIS], position[Y_AXIS], position[Z_AXIS], position[E_AXIS]);
 }
 
 void plan_set_e_position(const float &e)
 {
+  #ifdef LIN_ADVANCE
+  position_float[E_AXIS] = e;
+  #endif
   position[E_AXIS] = lround(e*axis_steps_per_unit[E_AXIS]);  
   st_set_e_position(position[E_AXIS]);
 }
@@ -1215,7 +1392,9 @@ void reset_acceleration_rates()
         axis_steps_per_sqr_second[i] = max_acceleration_units_per_sq_second[i] * axis_steps_per_unit[i];
         }
 }
-
+unsigned char number_of_blocks() {
+	return (block_buffer_head + BLOCK_BUFFER_SIZE - block_buffer_tail) & (BLOCK_BUFFER_SIZE - 1);
+}
 #ifdef PLANNER_DIAGNOSTICS
 uint8_t planner_queue_min()
 {
@@ -1227,3 +1406,28 @@ void planner_queue_min_reset()
   g_cntr_planner_queue_min = moves_planned();
 }
 #endif /* PLANNER_DIAGNOSTICS */
+
+void planner_add_sd_length(uint16_t sdlen)
+{
+  if (block_buffer_head != block_buffer_tail) {
+    // The planner buffer is not empty. Get the index of the last buffer line entered,
+    // which is (block_buffer_head - 1) modulo BLOCK_BUFFER_SIZE.
+    block_buffer[prev_block_index(block_buffer_head)].sdlen += sdlen;
+  } else {
+    // There is no line stored in the planner buffer, which means the last command does not need to be revertible,
+    // at a power panic, so the length of this command may be forgotten.
+  }
+}
+
+uint16_t planner_calc_sd_length()
+{
+	unsigned char _block_buffer_head = block_buffer_head;
+	unsigned char _block_buffer_tail = block_buffer_tail;
+	uint16_t sdlen = 0;
+	while (_block_buffer_head != _block_buffer_tail)
+	{
+		sdlen += block_buffer[_block_buffer_tail].sdlen;
+	    _block_buffer_tail = (_block_buffer_tail + 1) & (BLOCK_BUFFER_SIZE - 1);  
+	}
+	return sdlen;
+}

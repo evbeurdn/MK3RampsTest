@@ -88,7 +88,18 @@ typedef struct {
 
   // Pre-calculated division for the calculate_trapezoid_for_block() routine to run faster.
   float speed_factor;
+    
+#ifdef LIN_ADVANCE
+  bool use_advance_lead;
+  unsigned long abs_adv_steps_multiplier8; // Factorised by 2^8 to avoid float
+#endif
+
+  uint16_t sdlen;
 } block_t;
+
+#ifdef LIN_ADVANCE
+  extern float extruder_advance_k, advance_ed_ratio;
+#endif
 
 #ifdef ENABLE_AUTO_BED_LEVELING
 // this holds the required transform to compensate for bed level
@@ -148,7 +159,11 @@ extern unsigned long axis_steps_per_sqr_second[NUM_AXIS];
 
 
 extern block_t block_buffer[BLOCK_BUFFER_SIZE];            // A ring buffer for motion instfructions
-extern volatile unsigned char block_buffer_head;           // Index of the next block to be pushed
+// Index of the next block to be pushed into the planner queue.
+extern volatile unsigned char block_buffer_head;
+// Index of the first block in the planner queue.
+// This is the block, which is being currently processed by the stepper routine, 
+// or which is first to be processed by the stepper routine.
 extern volatile unsigned char block_buffer_tail; 
 // Called when the current block is no longer needed. Discards the block and makes the memory
 // available for new blocks.    
@@ -159,7 +174,10 @@ FORCE_INLINE void plan_discard_current_block()
   }
 }
 
-// Gets the current block. Returns NULL if buffer empty
+// Gets the current block. This is the block to be exectuted by the stepper routine.
+// Mark this block as busy, so its velocities and acceperations will be no more recalculated
+// by the planner routine.
+// Returns NULL if buffer empty
 FORCE_INLINE block_t *plan_get_current_block() 
 {
   if (block_buffer_head == block_buffer_tail) { 
@@ -171,7 +189,9 @@ FORCE_INLINE block_t *plan_get_current_block()
 }
 
 // Returns true if the buffer has a queued block, false otherwise
-FORCE_INLINE bool blocks_queued() { return (block_buffer_head != block_buffer_tail); }
+FORCE_INLINE bool blocks_queued() { 
+	return (block_buffer_head != block_buffer_tail); 
+}
 
 //return the nr of buffered moves
 FORCE_INLINE uint8_t moves_planned() {
@@ -197,6 +217,8 @@ void set_extrude_min_temp(float temp);
 void reset_acceleration_rates();
 #endif
 
+unsigned char number_of_blocks();
+
 // #define PLANNER_DIAGNOSTICS
 #ifdef PLANNER_DIAGNOSTICS
 // Diagnostic functions to display planner buffer underflow on the display.
@@ -204,3 +226,7 @@ extern uint8_t planner_queue_min();
 // Diagnostic function: Reset the minimum planner segments.
 extern void planner_queue_min_reset();
 #endif /* PLANNER_DIAGNOSTICS */
+
+extern void planner_add_sd_length(uint16_t sdlen);
+
+extern uint16_t planner_calc_sd_length();

@@ -4,7 +4,8 @@
 use strict;
 use warnings;
 
-my @langs = ("en","cz","it","es","pl","de");
+#my @langs = ("en","cz","it","es","de");
+my @langs = ("en","cz");
 
 sub parselang 
 {
@@ -180,6 +181,7 @@ print $fh <<END
 #ifndef LANGUAGE_ALL_H
 #define LANGUAGE_ALL_H
 
+#include <avr/pgmspace.h>
 // Language indices into their particular symbol tables.
 END
 ;
@@ -242,7 +244,7 @@ $filename = 'language_all.cpp';
 open($fh, '>', $filename) or die "Could not open file '$filename' $!";
 
 print $fh <<'END'
-#include <avr/pgmspace.h>
+
 #include "Configuration_prusa.h"
 #include "language_all.h"
 

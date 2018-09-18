@@ -34,15 +34,15 @@ const bool Z_MIN_ENDSTOP_INVERTING = false; // set to true to invert the logic o
 // Home position
 #define MANUAL_X_HOME_POS 0
 #define MANUAL_Y_HOME_POS -2.2
-#define MANUAL_Z_HOME_POS 0.15
+#define MANUAL_Z_HOME_POS 0.2
 
 // Travel limits after homing
-#define X_MAX_POS 250
+#define X_MAX_POS 255
 #define X_MIN_POS 0
 #define Y_MAX_POS 210
-#define Y_MIN_POS -2.2
+#define Y_MIN_POS -4
 #define Z_MAX_POS 210
-#define Z_MIN_POS 0.15
+#define Z_MIN_POS 0.2
 
 // Canceled home position
 #define X_CANCEL_POS 50
@@ -51,11 +51,11 @@ const bool Z_MIN_ENDSTOP_INVERTING = false; // set to true to invert the logic o
 #define NUM_AXIS 4 // The axis order in all axis related arrays is X, Y, Z, E
 #define HOMING_FEEDRATE {3000, 3000, 800, 0}  // set the homing speeds (mm/min)
 
-#define DEFAULT_MAX_FEEDRATE          {500, 500, 12, 120}    // (mm/sec)
-#define DEFAULT_MAX_ACCELERATION      {9000,9000,500,10000}    // X, Y, Z, E maximum start speed for accelerated moves. E default values are good for Skeinforge 40+, for older versions raise them a lot.
+#define DEFAULT_MAX_FEEDRATE          {500, 500, 1000, 25}    // (mm/sec)
+#define DEFAULT_MAX_ACCELERATION      {9000,9000,1000,10000}    // X, Y, Z, E maximum start speed for accelerated moves. E default values are good for Skeinforge 40+, for older versions raise them a lot.
 
-#define DEFAULT_ACCELERATION          1500    // X, Y, Z and E max acceleration in mm/s^2 for printing moves
-#define DEFAULT_RETRACT_ACCELERATION  1500   // X, Y, Z and E max acceleration in mm/s^2 for retracts
+#define DEFAULT_ACCELERATION          3000    // X, Y, Z and E max acceleration in mm/s^2 for printing moves
+#define DEFAULT_RETRACT_ACCELERATION  3000   // X, Y, Z and E max acceleration in mm/s^2 for retracts
 
 
 #define MANUAL_FEEDRATE {3000, 3000, 1000, 100}   // set the speeds for manual moves (mm/min)
@@ -93,18 +93,20 @@ EXTRUDER SETTINGS
 #define EXTRUDER_AUTO_FAN_TEMPERATURE 50
 #define EXTRUDER_AUTO_FAN_SPEED   255  // == full speed
 
-// Prusa Single extruder multiple material suport
-//#define SNMM
 
-#ifdef SNMM
-//#define BOWDEN_LENGTH	408
-#define BOWDEN_LENGTH 457 //total length for filament fast loading part; max length for extrusion is 465 mm!
-#define FIL_LOAD_LENGTH 102 //length for loading filament into the nozzle
-#define FIL_RETURN_LENGTH 30.5 //for filament adjusting (PRUSAY code)
-#define E_MOTOR_LOW_CURRENT 350 // current for PRUSAY code
-#define E_MOTOR_HIGH_CURRENT 700 //current for unloading filament, stop print, PRUSAY ramming
 
-#endif
+/*------------------------------------
+LOAD/UNLOAD FILAMENT SETTINGS
+*------------------------------------*/
+
+// Load filament commands
+#define LOAD_FILAMENT_0 "M83"
+#define LOAD_FILAMENT_1 "G1 E70 F400"
+#define LOAD_FILAMENT_2 "G1 E40 F100"
+
+// Unload filament commands
+#define UNLOAD_FILAMENT_0 "M83"
+#define UNLOAD_FILAMENT_1 "G1 E-80 F400"
 
 /*------------------------------------
 CHANGE FILAMENT SETTINGS
@@ -310,22 +312,5 @@ THERMISTORS SETTINGS
 #define TEMP_SENSOR_2 0
 #define TEMP_SENSOR_BED 1
 
-#define STACK_GUARD_TEST_VALUE 0xA2A2
-
-#define MAX_BED_TEMP_CALIBRATION 50
-#define MAX_HOTEND_TEMP_CALIBRATION 50
-
-#define MAX_E_STEPS_PER_UNIT 250
-#define MIN_E_STEPS_PER_UNIT 100
-
-#define PRINT_STARTED 0xFE
-#define PRINT_FINISHED 0xFF
-
-#define Z_BABYSTEP_MIN -3999
-#define Z_BABYSTEP_MAX 0
-
-#define PING_TIME 25 //time in s
-#define PING_TIME_LONG 600 //10 min; used when length of commands buffer > 0 to avoid false triggering when dealing with long gcodes
-#define PING_ALLERT_PERIOD 60 //time in s
 
 #endif //__CONFIGURATION_PRUSA_H

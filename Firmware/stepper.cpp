@@ -32,14 +32,29 @@
 #if defined(DIGIPOTSS_PIN) && DIGIPOTSS_PIN > -1
 #include <SPI.h>
 #endif
+#ifdef TMC2130
+#include "tmc2130.h"
+#endif //TMC2130
 
+#ifdef PAT9125
+#include "fsensor.h"
+int fsensor_counter = 0; //counter for e-steps
+#endif //PAT9125
+
+#ifdef DEBUG_STACK_MONITOR
+uint16_t SP_min = 0x21FF;
+#endif //DEBUG_STACK_MONITOR
 
 //===========================================================================
 //=============================public variables  ============================
 //===========================================================================
 block_t *current_block;  // A pointer to the block currently being traced
-
-
+bool x_min_endstop = false;
+bool x_max_endstop = false;
+bool y_min_endstop = false;
+bool y_max_endstop = false;
+bool z_min_endstop = false;
+bool z_max_endstop = false;
 //===========================================================================
 //=============================private variables ============================
 //===========================================================================
@@ -51,7 +66,7 @@ static int32_t counter_x,       // Counter variables for the bresenham line trac
                counter_y,
                counter_z,
                counter_e;
-volatile static uint32_t step_events_completed; // The number of step events executed in the current block
+volatile uint32_t step_events_completed; // The number of step events executed in the current block
 static int32_t  acceleration_time, deceleration_time;
 //static unsigned long accelerate_until, decelerate_after, acceleration_rate, initial_rate, final_rate, nominal_rate;
 static uint16_t acc_step_rate; // needed for deccelaration start point
@@ -81,18 +96,47 @@ static bool old_z_min_endstop=false;
 static bool old_z_max_endstop=false;
 
 static bool check_endstops = true;
+
 static bool check_z_endstop = false;
 
-int8_t SilentMode;
+int8_t SilentMode = 0;
 
 volatile long count_position[NUM_AXIS] = { 0, 0, 0, 0};
 volatile signed char count_direction[NUM_AXIS] = { 1, 1, 1, 1};
+
+uint8_t LastStepMask = 0;
+
+#ifdef LIN_ADVANCE
+
+  uint16_t ADV_NEVER = 65535;
+
+  static uint16_t nextMainISR = 0;
+  static uint16_t nextAdvanceISR = ADV_NEVER;
+  static uint16_t eISR_Rate = ADV_NEVER;
+
+  static volatile int e_steps; //Extrusion steps to be executed by the stepper
+  static int final_estep_rate; //Speed of extruder at cruising speed
+  static int current_estep_rate; //The current speed of the extruder
+  static int current_adv_steps; //The current pretension of filament expressed in steps
+
+  #define ADV_RATE(T, L) (e_steps ? (T) * (L) / abs(e_steps) : ADV_NEVER)
+  #define _NEXT_ISR(T) nextMainISR = T
+
+#else
+  #define _NEXT_ISR(T) OCR1A = T
+#endif
+
+#ifdef DEBUG_STEPPER_TIMER_MISSED
+extern bool stepper_timer_overflow_state;
+#endif /* DEBUG_STEPPER_TIMER_MISSED */
 
 //===========================================================================
 //=============================functions         ============================
 //===========================================================================
 
 #define CHECK_ENDSTOPS  if(check_endstops)
+
+#ifndef _NO_ASM
 
 // intRes = intIn1 * intIn2 >> 16
 // uses:
@@ -164,11 +208,19 @@ asm volatile ( \
 "r26" , "r27" \
 )
 
+#else //_NO_ASM
+
+void MultiU16X8toH16(unsigned short& intRes, unsigned char& charIn1, unsigned short& intIn2)
+{
+}
+
+void MultiU24X24toH16(uint16_t& intRes, int32_t& longIn1, long& longIn2)
+{
+}
+
+#endif //_NO_ASM
+
 // Some useful constants
-
-#define ENABLE_STEPPER_DRIVER_INTERRUPT()  TIMSK1 |= (1<<OCIE1A)
-#define DISABLE_STEPPER_DRIVER_INTERRUPT() TIMSK1 &= ~(1<<OCIE1A)
-
 
 void checkHitEndstops()
 {
@@ -252,17 +304,6 @@ bool enable_z_endstop(bool check)
 //  step_events_completed reaches block->decelerate_after after which it decelerates until the trapezoid generator is reset.
 //  The slope of acceleration is calculated with the leib ramp alghorithm.
 
-void st_wake_up() {
-  //  TCNT1 = 0;
-  ENABLE_STEPPER_DRIVER_INTERRUPT();
-}
-
-void step_wait(){
-    for(int8_t i=0; i < 6; i++){
-    }
-}
-
-
 FORCE_INLINE unsigned short calc_timer(unsigned short step_rate) {
   unsigned short timer;
   if(step_rate > MAX_STEP_FREQUENCY) step_rate = MAX_STEP_FREQUENCY;
@@ -278,6 +319,7 @@ FORCE_INLINE unsigned short calc_timer(unsigned short step_rate) {
   else {
     step_loops = 1;
   }
+//    step_loops = 1;
 
   if(step_rate < (F_CPU/500000)) step_rate = (F_CPU/500000);
   step_rate -= (F_CPU/500000); // Correct for minimal speed
@@ -308,30 +350,43 @@ FORCE_INLINE void trapezoid_generator_reset() {
   step_loops_nominal = step_loops;
   acc_step_rate = current_block->initial_rate;
   acceleration_time = calc_timer(acc_step_rate);
-  OCR1A = acceleration_time;
+  _NEXT_ISR(acceleration_time);
 
-//    SERIAL_ECHO_START;
-//    SERIAL_ECHOPGM("advance :");
-//    SERIAL_ECHO(current_block->advance/256.0);
-//    SERIAL_ECHOPGM("advance rate :");
-//    SERIAL_ECHO(current_block->advance_rate/256.0);
-//    SERIAL_ECHOPGM("initial advance :");
-//  SERIAL_ECHO(current_block->initial_advance/256.0);
-//    SERIAL_ECHOPGM("final advance :");
-//    SERIAL_ECHOLN(current_block->final_advance/256.0);
+  #ifdef LIN_ADVANCE
+    if (current_block->use_advance_lead) {
+        current_estep_rate = ((unsigned long)acc_step_rate * current_block->abs_adv_steps_multiplier8) >> 17;
+        final_estep_rate = (current_block->nominal_rate * current_block->abs_adv_steps_multiplier8) >> 17;
+        }
+   #endif
 
 }
 
 // "The Stepper Driver Interrupt" - This timer interrupt is the workhorse.
 // It pops blocks from the block_buffer and executes them by pulsing the stepper pins appropriately.
-ISR(TIMER1_COMPA_vect)
-{
+ISR(TIMER1_COMPA_vect) {
+#ifdef DEBUG_STACK_MONITOR
+	uint16_t sp = SPL + 256 * SPH;
+	if (sp < SP_min) SP_min = sp;
+#endif //DEBUG_STACK_MONITOR
+  #ifdef LIN_ADVANCE
+    advance_isr_scheduler();
+  #else
+      isr();
+  #endif
+}
+
+void isr() {
+	//if (UVLO) uvlo();
   // If there is no current block, attempt to pop one from the buffer
   if (current_block == NULL) {
     // Anything in the buffer?
     current_block = plan_get_current_block();
     if (current_block != NULL) {
-      // The busy flag is set by the plan_get_current_block() call.
+#ifdef PAT9125
+	  fsensor_counter = 0;
+      fsensor_st_block_begin(current_block);
+#endif //PAT9125
+	  // The busy flag is set by the plan_get_current_block() call.
       // current_block->busy = true;
       trapezoid_generator_reset();
       counter_x = -(current_block->step_event_count >> 1);
@@ -343,15 +398,17 @@ ISR(TIMER1_COMPA_vect)
       #ifdef Z_LATE_ENABLE
         if(current_block->steps_z > 0) {
           enable_z();
-          OCR1A = 2000; //1ms wait
+          _NEXT_ISR(2000); //1ms wait
           return;
         }
       #endif
     }
     else {
-        OCR1A=2000; // 1kHz.
+        _NEXT_ISR(2000); // 1kHz.
     }
   }
+
+	LastStepMask = 0;
 
   if (current_block != NULL) {
     // Set directions TO DO This should be done once during init of trapezoid. Endstops -> interrupt
@@ -360,27 +417,27 @@ ISR(TIMER1_COMPA_vect)
 
     // Set the direction bits (X_AXIS=A_AXIS and Y_AXIS=B_AXIS for COREXY)
     if((out_bits & (1<<X_AXIS))!=0){
-        WRITE(X_DIR_PIN, INVERT_X_DIR);
+        WRITE_NC(X_DIR_PIN, INVERT_X_DIR);
       count_direction[X_AXIS]=-1;
     }
     else{
-        WRITE(X_DIR_PIN, !INVERT_X_DIR);
+        WRITE_NC(X_DIR_PIN, !INVERT_X_DIR);
       count_direction[X_AXIS]=1;
     }
     if((out_bits & (1<<Y_AXIS))!=0){
-      WRITE(Y_DIR_PIN, INVERT_Y_DIR);
+      WRITE_NC(Y_DIR_PIN, INVERT_Y_DIR);
 	  
 	  #ifdef Y_DUAL_STEPPER_DRIVERS
-	    WRITE(Y2_DIR_PIN, !(INVERT_Y_DIR == INVERT_Y2_VS_Y_DIR));
+	    WRITE_NC(Y2_DIR_PIN, !(INVERT_Y_DIR == INVERT_Y2_VS_Y_DIR));
 	  #endif
 	  
       count_direction[Y_AXIS]=-1;
     }
     else{
-      WRITE(Y_DIR_PIN, !INVERT_Y_DIR);
+      WRITE_NC(Y_DIR_PIN, !INVERT_Y_DIR);
 	  
 	  #ifdef Y_DUAL_STEPPER_DRIVERS
-	    WRITE(Y2_DIR_PIN, (INVERT_Y_DIR == INVERT_Y2_VS_Y_DIR));
+	    WRITE_NC(Y2_DIR_PIN, (INVERT_Y_DIR == INVERT_Y2_VS_Y_DIR));
 	  #endif
 	  
       count_direction[Y_AXIS]=1;
@@ -395,8 +452,15 @@ ISR(TIMER1_COMPA_vect)
       CHECK_ENDSTOPS
       {
         {
-          #if defined(X_MIN_PIN) && X_MIN_PIN > -1
-            bool x_min_endstop=(READ(X_MIN_PIN) != X_MIN_ENDSTOP_INVERTING);
+          #if ( (defined(X_MIN_PIN) && (X_MIN_PIN > -1)) || defined(TMC2130_SG_HOMING) ) && !defined(DEBUG_DISABLE_XMINLIMIT)
+            
+            #ifdef TMC2130_SG_HOMING
+            // Stall guard homing turned on
+                x_min_endstop = (READ(X_TMC2130_DIAG) != 0);
+            #else
+            // Normal homing
+            x_min_endstop = (READ(X_MIN_PIN) != X_MIN_ENDSTOP_INVERTING);
+            #endif
             if(x_min_endstop && old_x_min_endstop && (current_block->steps_x > 0)) {
               endstops_trigsteps[X_AXIS] = count_position[X_AXIS];
               endstop_x_hit=true;
@@ -411,8 +475,15 @@ ISR(TIMER1_COMPA_vect)
       CHECK_ENDSTOPS
       {
         {
-          #if defined(X_MAX_PIN) && X_MAX_PIN > -1
-            bool x_max_endstop=(READ(X_MAX_PIN) != X_MAX_ENDSTOP_INVERTING);
+          #if ( (defined(X_MAX_PIN) && (X_MAX_PIN > -1)) || defined(TMC2130_SG_HOMING) ) && !defined(DEBUG_DISABLE_XMAXLIMIT)
+            
+            #ifdef TMC2130_SG_HOMING
+            // Stall guard homing turned on
+                x_max_endstop = (READ(X_TMC2130_DIAG) != 0);
+            #else
+            // Normal homing
+            x_max_endstop = (READ(X_MAX_PIN) != X_MAX_ENDSTOP_INVERTING);
+            #endif
             if(x_max_endstop && old_x_max_endstop && (current_block->steps_x > 0)){
               endstops_trigsteps[X_AXIS] = count_position[X_AXIS];
               endstop_x_hit=true;
@@ -431,8 +502,16 @@ ISR(TIMER1_COMPA_vect)
     #endif
       CHECK_ENDSTOPS
       {
-        #if defined(Y_MIN_PIN) && Y_MIN_PIN > -1
-          bool y_min_endstop=(READ(Y_MIN_PIN) != Y_MIN_ENDSTOP_INVERTING);
+          
+        #if ( (defined(Y_MIN_PIN) && (Y_MIN_PIN > -1)) || defined(TMC2130_SG_HOMING) ) && !defined(DEBUG_DISABLE_YMINLIMIT)
+                  
+        #ifdef TMC2130_SG_HOMING
+        // Stall guard homing turned on
+            y_min_endstop = (READ(Y_TMC2130_DIAG) != 0);
+        #else
+        // Normal homing
+        y_min_endstop = (READ(Y_MIN_PIN) != Y_MIN_ENDSTOP_INVERTING);
+        #endif
           if(y_min_endstop && old_y_min_endstop && (current_block->steps_y > 0)) {
             endstops_trigsteps[Y_AXIS] = count_position[Y_AXIS];
             endstop_y_hit=true;
@@ -445,8 +524,15 @@ ISR(TIMER1_COMPA_vect)
     else { // +direction
       CHECK_ENDSTOPS
       {
-        #if defined(Y_MAX_PIN) && Y_MAX_PIN > -1
-          bool y_max_endstop=(READ(Y_MAX_PIN) != Y_MAX_ENDSTOP_INVERTING);
+        #if ( (defined(Y_MAX_PIN) && (Y_MAX_PIN > -1)) || defined(TMC2130_SG_HOMING) ) && !defined(DEBUG_DISABLE_YMAXLIMIT)
+                  
+        #ifdef TMC2130_SG_HOMING
+        // Stall guard homing turned on
+            y_max_endstop = (READ(Y_TMC2130_DIAG) != 0);
+        #else
+        // Normal homing
+        y_max_endstop = (READ(Y_MAX_PIN) != Y_MAX_ENDSTOP_INVERTING);
+        #endif
           if(y_max_endstop && old_y_max_endstop && (current_block->steps_y > 0)){
             endstops_trigsteps[Y_AXIS] = count_position[Y_AXIS];
             endstop_y_hit=true;
@@ -458,17 +544,22 @@ ISR(TIMER1_COMPA_vect)
     }
 
     if ((out_bits & (1<<Z_AXIS)) != 0) {   // -direction
-      WRITE(Z_DIR_PIN,INVERT_Z_DIR);
+      WRITE_NC(Z_DIR_PIN,INVERT_Z_DIR);
       
       #ifdef Z_DUAL_STEPPER_DRIVERS
-        WRITE(Z2_DIR_PIN,INVERT_Z_DIR);
+        WRITE_NC(Z2_DIR_PIN,INVERT_Z_DIR);
       #endif
 
       count_direction[Z_AXIS]=-1;
       if(check_endstops && ! check_z_endstop)
       {
-        #if defined(Z_MIN_PIN) && Z_MIN_PIN > -1
-          bool z_min_endstop=(READ(Z_MIN_PIN) != Z_MIN_ENDSTOP_INVERTING);
+        #if defined(Z_MIN_PIN) && (Z_MIN_PIN > -1) && !defined(DEBUG_DISABLE_ZMINLIMIT)
+            #ifdef TMC2130_SG_HOMING
+            // Stall guard homing turned on
+                z_min_endstop = (READ(Z_MIN_PIN) != Z_MIN_ENDSTOP_INVERTING) || (READ(Z_TMC2130_DIAG) != 0);
+            #else
+				z_min_endstop = (READ(Z_MIN_PIN) != Z_MIN_ENDSTOP_INVERTING);
+            #endif //TMC2130_SG_HOMING
           if(z_min_endstop && old_z_min_endstop && (current_block->steps_z > 0)) {
             endstops_trigsteps[Z_AXIS] = count_position[Z_AXIS];
             endstop_z_hit=true;
@@ -479,17 +570,22 @@ ISR(TIMER1_COMPA_vect)
       }
     }
     else { // +direction
-      WRITE(Z_DIR_PIN,!INVERT_Z_DIR);
+      WRITE_NC(Z_DIR_PIN,!INVERT_Z_DIR);
 
       #ifdef Z_DUAL_STEPPER_DRIVERS
-        WRITE(Z2_DIR_PIN,!INVERT_Z_DIR);
+        WRITE_NC(Z2_DIR_PIN,!INVERT_Z_DIR);
       #endif
 
       count_direction[Z_AXIS]=1;
       CHECK_ENDSTOPS
       {
-        #if defined(Z_MAX_PIN) && Z_MAX_PIN > -1
-          bool z_max_endstop=(READ(Z_MAX_PIN) != Z_MAX_ENDSTOP_INVERTING);
+        #if defined(Z_MAX_PIN) && (Z_MAX_PIN > -1) && !defined(DEBUG_DISABLE_ZMAXLIMIT)
+            #ifdef TMC2130_SG_HOMING
+            // Stall guard homing turned on
+                z_max_endstop = (READ(Z_TMC2130_DIAG) != 0);
+            #else
+				z_max_endstop = (READ(Z_MAX_PIN) != Z_MAX_ENDSTOP_INVERTING);
+            #endif //TMC2130_SG_HOMING
           if(z_max_endstop && old_z_max_endstop && (current_block->steps_z > 0)) {
             endstops_trigsteps[Z_AXIS] = count_position[Z_AXIS];
             endstop_z_hit=true;
@@ -501,11 +597,16 @@ ISR(TIMER1_COMPA_vect)
     }
 
     // Supporting stopping on a trigger of the Z-stop induction sensor, not only for the Z-minus movements.
-    #if defined(Z_MIN_PIN) && Z_MIN_PIN > -1
+    #if defined(Z_MIN_PIN) && (Z_MIN_PIN > -1) && !defined(DEBUG_DISABLE_ZMINLIMIT)
     if(check_z_endstop) {
         // Check the Z min end-stop no matter what.
         // Good for searching for the center of an induction target.
-        bool z_min_endstop=(READ(Z_MIN_PIN) != Z_MIN_ENDSTOP_INVERTING);
+            #ifdef TMC2130_SG_HOMING
+            // Stall guard homing turned on
+                z_min_endstop = (READ(Z_MIN_PIN) != Z_MIN_ENDSTOP_INVERTING) || (READ(Z_TMC2130_DIAG) != 0);
+            #else
+				z_min_endstop = (READ(Z_MIN_PIN) != Z_MIN_ENDSTOP_INVERTING);
+            #endif //TMC2130_SG_HOMING
         if(z_min_endstop && old_z_min_endstop) {
           endstops_trigsteps[Z_AXIS] = count_position[Z_AXIS];
           endstop_z_hit=true;
@@ -515,75 +616,139 @@ ISR(TIMER1_COMPA_vect)
     }
     #endif
 
-    if ((out_bits & (1<<E_AXIS)) != 0) {  // -direction
-      REV_E_DIR();
-      count_direction[E_AXIS]=-1;
-    }
-    else { // +direction
-      NORM_E_DIR();
-      count_direction[E_AXIS]=1;
-    }
+	if ((out_bits & (1 << E_AXIS)) != 0)
+	{	// -direction
+		//AKU
+#ifdef SNMM
+		if (snmm_extruder == 0 || snmm_extruder == 2)
+		{
+			NORM_E_DIR();
+		}
+		else
+		{
+			REV_E_DIR();
+		}
+#else
+		REV_E_DIR();
+#endif // SNMM
+		count_direction[E_AXIS] = -1;
+	}
+	else
+	{	// +direction
+#ifdef SNMM
+		if (snmm_extruder == 0 || snmm_extruder == 2)
+		{
+			REV_E_DIR();
+		}
+		else
+		{
+			NORM_E_DIR();
+		}
+#else
+		NORM_E_DIR();
+#endif // SNMM
+		count_direction[E_AXIS] = 1;
+	}
 
     for(uint8_t i=0; i < step_loops; i++) { // Take multiple steps per interrupt (For high speed moves)
       #ifndef AT90USB
       MSerial.checkRx(); // Check for serial chars.
-      #endif
+      #endif //RP - returned, because missing characters
 
+#ifdef LIN_ADVANCE
+        counter_e += current_block->steps_e;
+        if (counter_e > 0) {
+          counter_e -= current_block->step_event_count;
+          count_position[E_AXIS] += count_direction[E_AXIS];
+          ((out_bits&(1<<E_AXIS))!=0) ? --e_steps : ++e_steps;
+        }
+#endif
+        
         counter_x += current_block->steps_x;
         if (counter_x > 0) {
-          WRITE(X_STEP_PIN, !INVERT_X_STEP_PIN);
+          WRITE_NC(X_STEP_PIN, !INVERT_X_STEP_PIN);
+		  LastStepMask |= X_AXIS_MASK;
+#ifdef DEBUG_XSTEP_DUP_PIN
+    WRITE_NC(DEBUG_XSTEP_DUP_PIN,!INVERT_X_STEP_PIN);
+#endif //DEBUG_XSTEP_DUP_PIN
           counter_x -= current_block->step_event_count;
           count_position[X_AXIS]+=count_direction[X_AXIS];   
-          WRITE(X_STEP_PIN, INVERT_X_STEP_PIN);
+          WRITE_NC(X_STEP_PIN, INVERT_X_STEP_PIN);
+#ifdef DEBUG_XSTEP_DUP_PIN
+    WRITE_NC(DEBUG_XSTEP_DUP_PIN,INVERT_X_STEP_PIN);
+#endif //DEBUG_XSTEP_DUP_PIN
         }
 
         counter_y += current_block->steps_y;
         if (counter_y > 0) {
-          WRITE(Y_STEP_PIN, !INVERT_Y_STEP_PIN);
+          WRITE_NC(Y_STEP_PIN, !INVERT_Y_STEP_PIN);
+		  LastStepMask |= Y_AXIS_MASK;
+#ifdef DEBUG_YSTEP_DUP_PIN
+    WRITE_NC(DEBUG_YSTEP_DUP_PIN,!INVERT_Y_STEP_PIN);
+#endif //DEBUG_YSTEP_DUP_PIN
 		  
 		  #ifdef Y_DUAL_STEPPER_DRIVERS
-			WRITE(Y2_STEP_PIN, !INVERT_Y_STEP_PIN);
+			WRITE_NC(Y2_STEP_PIN, !INVERT_Y_STEP_PIN);
 		  #endif
 		  
           counter_y -= current_block->step_event_count;
           count_position[Y_AXIS]+=count_direction[Y_AXIS];
-          WRITE(Y_STEP_PIN, INVERT_Y_STEP_PIN);
+          WRITE_NC(Y_STEP_PIN, INVERT_Y_STEP_PIN);
+#ifdef DEBUG_YSTEP_DUP_PIN
+    WRITE_NC(DEBUG_YSTEP_DUP_PIN,INVERT_Y_STEP_PIN);
+#endif //DEBUG_YSTEP_DUP_PIN
 		  
 		  #ifdef Y_DUAL_STEPPER_DRIVERS
-			WRITE(Y2_STEP_PIN, INVERT_Y_STEP_PIN);
+			WRITE_NC(Y2_STEP_PIN, INVERT_Y_STEP_PIN);
 		  #endif
         }
 
       counter_z += current_block->steps_z;
       if (counter_z > 0) {
-        WRITE(Z_STEP_PIN, !INVERT_Z_STEP_PIN);
-        
+        WRITE_NC(Z_STEP_PIN, !INVERT_Z_STEP_PIN);
+        LastStepMask |= Z_AXIS_MASK;
         #ifdef Z_DUAL_STEPPER_DRIVERS
-          WRITE(Z2_STEP_PIN, !INVERT_Z_STEP_PIN);
+          WRITE_NC(Z2_STEP_PIN, !INVERT_Z_STEP_PIN);
         #endif
 
         counter_z -= current_block->step_event_count;
         count_position[Z_AXIS]+=count_direction[Z_AXIS];
-        WRITE(Z_STEP_PIN, INVERT_Z_STEP_PIN);
+        WRITE_NC(Z_STEP_PIN, INVERT_Z_STEP_PIN);
         
         #ifdef Z_DUAL_STEPPER_DRIVERS
-          WRITE(Z2_STEP_PIN, INVERT_Z_STEP_PIN);
+          WRITE_NC(Z2_STEP_PIN, INVERT_Z_STEP_PIN);
         #endif
       }
 
+#ifndef LIN_ADVANCE
         counter_e += current_block->steps_e;
         if (counter_e > 0) {
           WRITE_E_STEP(!INVERT_E_STEP_PIN);
           counter_e -= current_block->step_event_count;
           count_position[E_AXIS]+=count_direction[E_AXIS];
           WRITE_E_STEP(INVERT_E_STEP_PIN);
+#ifdef PAT9125
+          fsensor_counter++;
+#endif //PAT9125
         }
+#endif
+        
       step_events_completed += 1;
       if(step_events_completed >= current_block->step_event_count) break;
     }
+#ifdef LIN_ADVANCE
+      if (current_block->use_advance_lead) {
+        const int delta_adv_steps = current_estep_rate - current_adv_steps;
+        current_adv_steps += delta_adv_steps;
+        e_steps += delta_adv_steps;
+      }
+      // If we have esteps to execute, fire the next advance_isr "now"
+      if (e_steps) nextAdvanceISR = 0;
+#endif
+        
     // Calculare new timer value
     unsigned short timer;
-    unsigned short step_rate;
+    uint16_t step_rate;
     if (step_events_completed <= (unsigned long int)current_block->accelerate_until) {
       // v = t * a   ->   acc_step_rate = acceleration_time * current_block->acceleration_rate
       MultiU24X24toH16(acc_step_rate, acceleration_time, current_block->acceleration_rate);
@@ -595,8 +760,15 @@ ISR(TIMER1_COMPA_vect)
 
       // step_rate to timer interval
       timer = calc_timer(acc_step_rate);
-      OCR1A = timer;
+      _NEXT_ISR(timer);
       acceleration_time += timer;
+        
+#ifdef LIN_ADVANCE
+        if (current_block->use_advance_lead) {
+         current_estep_rate = ((uint32_t)acc_step_rate * current_block->abs_adv_steps_multiplier8) >> 17;
+        }
+        eISR_Rate = ADV_RATE(timer, step_loops);
+#endif
     }
     else if (step_events_completed > (unsigned long int)current_block->decelerate_after) {
       MultiU24X24toH16(step_rate, deceleration_time, current_block->acceleration_rate);
@@ -614,25 +786,142 @@ ISR(TIMER1_COMPA_vect)
 
       // step_rate to timer interval
       timer = calc_timer(step_rate);
-      OCR1A = timer;
+      _NEXT_ISR(timer);
       deceleration_time += timer;
+        
+#ifdef LIN_ADVANCE
+        if (current_block->use_advance_lead) {
+          current_estep_rate = ((uint32_t)step_rate * current_block->abs_adv_steps_multiplier8) >> 17;
+        }
+        eISR_Rate = ADV_RATE(timer, step_loops);
+#endif
     }
     else {
-      OCR1A = OCR1A_nominal;
+#ifdef LIN_ADVANCE
+        if (current_block->use_advance_lead)
+          current_estep_rate = final_estep_rate;
+
+        eISR_Rate = ADV_RATE(OCR1A_nominal, step_loops_nominal);
+#endif
+
+      _NEXT_ISR(OCR1A_nominal);
       // ensure we're running at the correct step rate, even if we just came off an acceleration
       step_loops = step_loops_nominal;
     }
 
     // If current block is finished, reset pointer
     if (step_events_completed >= current_block->step_event_count) {
+
+#ifdef PAT9125
+      fsensor_st_block_chunk(current_block, fsensor_counter);
+	  fsensor_counter = 0;
+#endif //PAT9125
+
       current_block = NULL;
       plan_discard_current_block();
     }
+#ifdef PAT9125
+	else if (fsensor_counter >= fsensor_chunk_len)
+	{
+      fsensor_st_block_chunk(current_block, fsensor_counter);
+	  fsensor_counter = 0;
+	}
+#endif //PAT9125
   }
+#ifdef TMC2130
+	tmc2130_st_isr(LastStepMask);
+#endif //TMC2130
+#ifdef DEBUG_STEPPER_TIMER_MISSED
+  // Verify whether the next planned timer interrupt has not been missed already.  
+  // This debugging test takes < 1.125us
+  // This skews the profiling slightly as the fastest stepper timer
+  // interrupt repeats at a 100us rate (10kHz).
+  if (OCR1A < TCNT1) {
+    stepper_timer_overflow_state = true;
+    WRITE_NC(BEEPER, HIGH);
+    SERIAL_PROTOCOLPGM("Stepper timer overflow ");
+    SERIAL_PROTOCOL(OCR1A);
+    SERIAL_PROTOCOLPGM("<");
+    SERIAL_PROTOCOL(TCNT1);
+    SERIAL_PROTOCOLLN("!");
+  }
+#endif
 }
 
+#ifdef LIN_ADVANCE
+      
+      // Timer interrupt for E. e_steps is set in the main routine.
+      
+void advance_isr() {
+  if (e_steps) {
+      bool dir =
+#ifdef SNMM
+      ((e_steps < 0) == (snmm_extruder & 1))
+#else
+      (e_steps < 0)
+#endif
+      ? INVERT_E0_DIR : !INVERT_E0_DIR; //If we have SNMM, reverse every second extruder.
+      WRITE_NC(E0_DIR_PIN, dir);
+      
+      for (uint8_t i = step_loops; e_steps && i--;) {
+          WRITE_NC(E0_STEP_PIN, !INVERT_E_STEP_PIN);
+          e_steps < 0 ? ++e_steps : --e_steps;
+          WRITE_NC(E0_STEP_PIN, INVERT_E_STEP_PIN);
+#ifdef PAT9125
+		  fsensor_counter++;
+#endif //PAT9125
+
+      }
+  }
+  else {
+    eISR_Rate = ADV_NEVER;
+  }
+  nextAdvanceISR = eISR_Rate;
+}
+
+void advance_isr_scheduler() {
+  // Run main stepping ISR if flagged
+  if (!nextMainISR) isr();
+  
+  // Run Advance stepping ISR if flagged
+  if (!nextAdvanceISR) advance_isr();
+  
+  // Is the next advance ISR scheduled before the next main ISR?
+  if (nextAdvanceISR <= nextMainISR) {
+      // Set up the next interrupt
+      OCR1A = nextAdvanceISR;
+      // New interval for the next main ISR
+      if (nextMainISR) nextMainISR -= nextAdvanceISR;
+      // Will call Stepper::advance_isr on the next interrupt
+      nextAdvanceISR = 0;
+  }
+  else {
+      // The next main ISR comes first
+      OCR1A = nextMainISR;
+      // New interval for the next advance ISR, if any
+      if (nextAdvanceISR && nextAdvanceISR != ADV_NEVER)
+          nextAdvanceISR -= nextMainISR;
+      // Will call Stepper::isr on the next interrupt
+      nextMainISR = 0;
+  }
+  
+  // Don't run the ISR faster than possible
+  if (OCR1A < TCNT1 + 16) OCR1A = TCNT1 + 16;
+}
+
+void clear_current_adv_vars() {
+  e_steps = 0; //Should be already 0 at an filament change event, but just to be sure..
+  current_adv_steps = 0;
+}
+
+#endif // LIN_ADVANCE
+      
 void st_init()
 {
+#ifdef TMC2130
+	tmc2130_init();
+#endif //TMC2130
+
   digipot_init(); //Initialize Digipot Motor Current
   microstep_init(); //Initialize Microstepping Pins
 
@@ -710,6 +999,21 @@ void st_init()
 
   //endstops and pullups
 
+  #ifdef TMC2130_SG_HOMING
+    SET_INPUT(X_TMC2130_DIAG);
+    WRITE(X_TMC2130_DIAG,HIGH);
+    
+    SET_INPUT(Y_TMC2130_DIAG);
+    WRITE(Y_TMC2130_DIAG,HIGH);
+    
+    SET_INPUT(Z_TMC2130_DIAG);
+    WRITE(Z_TMC2130_DIAG,HIGH);
+
+	SET_INPUT(E0_TMC2130_DIAG);
+    WRITE(E0_TMC2130_DIAG,HIGH);
+    
+  #endif
+    
   #if defined(X_MIN_PIN) && X_MIN_PIN > -1
     SET_INPUT(X_MIN_PIN);
     #ifdef ENDSTOPPULLUP_XMIN
@@ -754,9 +1058,13 @@ void st_init()
 
 
   //Initialize Step Pins
-  #if defined(X_STEP_PIN) && (X_STEP_PIN > -1)
+#if defined(X_STEP_PIN) && (X_STEP_PIN > -1)
     SET_OUTPUT(X_STEP_PIN);
     WRITE(X_STEP_PIN,INVERT_X_STEP_PIN);
+#ifdef DEBUG_XSTEP_DUP_PIN
+    SET_OUTPUT(DEBUG_XSTEP_DUP_PIN);
+    WRITE(DEBUG_XSTEP_DUP_PIN,INVERT_X_STEP_PIN);
+#endif //DEBUG_XSTEP_DUP_PIN
     disable_x();
   #endif
   #if defined(X2_STEP_PIN) && (X2_STEP_PIN > -1)
@@ -767,6 +1075,10 @@ void st_init()
   #if defined(Y_STEP_PIN) && (Y_STEP_PIN > -1)
     SET_OUTPUT(Y_STEP_PIN);
     WRITE(Y_STEP_PIN,INVERT_Y_STEP_PIN);
+#ifdef DEBUG_YSTEP_DUP_PIN
+    SET_OUTPUT(DEBUG_YSTEP_DUP_PIN);
+    WRITE(DEBUG_YSTEP_DUP_PIN,INVERT_Y_STEP_PIN);
+#endif //DEBUG_YSTEP_DUP_PIN
     #if defined(Y_DUAL_STEPPER_DRIVERS) && defined(Y2_STEP_PIN) && (Y2_STEP_PIN > -1)
       SET_OUTPUT(Y2_STEP_PIN);
       WRITE(Y2_STEP_PIN,INVERT_Y_STEP_PIN);
@@ -815,10 +1127,16 @@ void st_init()
   // create_speed_lookuptable.py
   TCCR1B = (TCCR1B & ~(0x07<<CS10)) | (2<<CS10);
 
+  // Plan the first interrupt after 8ms from now.
   OCR1A = 0x4000;
   TCNT1 = 0;
   ENABLE_STEPPER_DRIVER_INTERRUPT();
 
+#ifdef LIN_ADVANCE
+    e_steps = 0;
+    current_adv_steps = 0;
+#endif
+    
   enable_endstops(true); // Start with endstops active. After homing they can be disabled
   sei();
 }
@@ -827,17 +1145,33 @@ void st_init()
 // Block until all buffered steps are executed
 void st_synchronize()
 {
-    while( blocks_queued()) {
-    manage_heater();
-    // Vojtech: Don't disable motors inside the planner!
-    manage_inactivity(true);
-    lcd_update();
-  }
+	while(blocks_queued())
+	{
+#ifdef TMC2130
+		manage_heater();
+		// Vojtech: Don't disable motors inside the planner!
+		if (!tmc2130_update_sg())
+		{
+			manage_inactivity(true);
+			lcd_update();
+		}
+#else //TMC2130
+		manage_heater();
+		// Vojtech: Don't disable motors inside the planner!
+		manage_inactivity(true);
+		lcd_update();
+#endif //TMC2130
+	}
 }
 
 void st_set_position(const long &x, const long &y, const long &z, const long &e)
 {
   CRITICAL_SECTION_START;
+  // Copy 4x4B.
+  // This block locks the interrupts globally for 4.56 us,
+  // which corresponds to a maximum repeat frequency of 219.18 kHz.
+  // This blocking is safe in the context of a 10kHz stepper driver interrupt
+  // or a 115200 Bd serial line receive interrupt, which will not trigger faster than 12kHz.
   count_position[X_AXIS] = x;
   count_position[Y_AXIS] = y;
   count_position[Z_AXIS] = z;
@@ -861,6 +1195,13 @@ long st_get_position(uint8_t axis)
   return count_pos;
 }
 
+void st_get_position_xy(long &x, long &y)
+{
+  CRITICAL_SECTION_START;
+  x = count_position[X_AXIS];
+  y = count_position[Y_AXIS];
+  CRITICAL_SECTION_END;
+}
 
 float st_get_position_mm(uint8_t axis)
 {
@@ -885,6 +1226,7 @@ void quickStop()
   DISABLE_STEPPER_DRIVER_INTERRUPT();
   while (blocks_queued()) plan_discard_current_block(); 
   current_block = NULL;
+  st_reset_timer();
   ENABLE_STEPPER_DRIVER_INTERRUPT();
 }
 
@@ -907,10 +1249,17 @@ void babystep(const uint8_t axis,const bool direction)
     
     //perform step 
     WRITE(X_STEP_PIN, !INVERT_X_STEP_PIN); 
+	LastStepMask |= X_AXIS_MASK;
+#ifdef DEBUG_XSTEP_DUP_PIN
+    WRITE(DEBUG_XSTEP_DUP_PIN,!INVERT_X_STEP_PIN);
+#endif //DEBUG_XSTEP_DUP_PIN
     {
     volatile float x=1./float(axis+1)/float(axis+2); //wait a tiny bit
     }
     WRITE(X_STEP_PIN, INVERT_X_STEP_PIN);
+#ifdef DEBUG_XSTEP_DUP_PIN
+    WRITE(DEBUG_XSTEP_DUP_PIN,INVERT_X_STEP_PIN);
+#endif //DEBUG_XSTEP_DUP_PIN
 
     //get old pin state back.
     WRITE(X_DIR_PIN,old_x_dir_pin);
@@ -926,10 +1275,17 @@ void babystep(const uint8_t axis,const bool direction)
     
     //perform step 
     WRITE(Y_STEP_PIN, !INVERT_Y_STEP_PIN); 
+	LastStepMask |= Y_AXIS_MASK;
+#ifdef DEBUG_YSTEP_DUP_PIN
+    WRITE(DEBUG_YSTEP_DUP_PIN,!INVERT_Y_STEP_PIN);
+#endif //DEBUG_YSTEP_DUP_PIN
     {
     volatile float x=1./float(axis+1)/float(axis+2); //wait a tiny bit
     }
     WRITE(Y_STEP_PIN, INVERT_Y_STEP_PIN);
+#ifdef DEBUG_YSTEP_DUP_PIN
+    WRITE(DEBUG_YSTEP_DUP_PIN,INVERT_Y_STEP_PIN);
+#endif //DEBUG_YSTEP_DUP_PIN
 
     //get old pin state back.
     WRITE(Y_DIR_PIN,old_y_dir_pin);
@@ -948,6 +1304,7 @@ void babystep(const uint8_t axis,const bool direction)
     #endif
     //perform step 
     WRITE(Z_STEP_PIN, !INVERT_Z_STEP_PIN); 
+	LastStepMask |= Z_AXIS_MASK;
     #ifdef Z_DUAL_STEPPER_DRIVERS
       WRITE(Z2_STEP_PIN, !INVERT_Z_STEP_PIN);
     #endif
@@ -1133,4 +1490,3 @@ void microstep_readings()
       SERIAL_PROTOCOLLN( digitalRead(E1_MS2_PIN));
       #endif
 }
-
