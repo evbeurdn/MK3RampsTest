@@ -88,16 +88,7 @@ typedef struct {
 
   // Pre-calculated division for the calculate_trapezoid_for_block() routine to run faster.
   float speed_factor;
-  
-  #ifdef LIN_ADVANCE
-    bool use_advance_lead;
-    unsigned long abs_adv_steps_multiplier8; // Factorised by 2^8 to avoid float
-  #endif
 } block_t;
-
-#ifdef LIN_ADVANCE
-  extern float extruder_advance_k, advance_ed_ratio;
-#endif
 
 #ifdef ENABLE_AUTO_BED_LEVELING
 // this holds the required transform to compensate for bed level
@@ -180,9 +171,7 @@ FORCE_INLINE block_t *plan_get_current_block()
 }
 
 // Returns true if the buffer has a queued block, false otherwise
-FORCE_INLINE bool blocks_queued() { 
-	return (block_buffer_head != block_buffer_tail); 
-}
+FORCE_INLINE bool blocks_queued() { return (block_buffer_head != block_buffer_tail); }
 
 //return the nr of buffered moves
 FORCE_INLINE uint8_t moves_planned() {

@@ -25,5 +25,5 @@ void SendColors(byte red, byte grn, byte blu)
   Wire.endTransmission();
 }
 
-#endif //BLINKM11
+#endif //BLINKM
 

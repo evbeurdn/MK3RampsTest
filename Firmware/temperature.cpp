@@ -51,12 +51,7 @@ float current_temperature_bed = 0.0;
   int redundant_temperature_raw = 0;
   float redundant_temperature = 0.0;
 #endif
-  
-
 #ifdef PIDTEMP
-  float _Kp, _Ki, _Kd;
-  int pid_cycle, pid_number_of_cycles;
-  bool pid_tuning_finished = false;
   float Kp=DEFAULT_Kp;
   float Ki=(DEFAULT_Ki*PID_dT);
   float Kd=(DEFAULT_Kd/PID_dT);
@@ -182,24 +177,14 @@ unsigned long watchmillis[EXTRUDERS] = ARRAY_BY_EXTRUDERS(0,0,0);
 #ifdef FILAMENT_SENSOR
   static int meas_shift_index;  //used to point to a delayed sample in buffer for filament width sensor
 #endif
-
-#if (defined (TEMP_RUNAWAY_BED_HYSTERESIS) && TEMP_RUNAWAY_BED_TIMEOUT > 0) || (defined (TEMP_RUNAWAY_EXTRUDER_HYSTERESIS) && TEMP_RUNAWAY_EXTRUDER_TIMEOUT > 0)
-static float temp_runaway_status[4];
-static float temp_runaway_target[4];
-static float temp_runaway_timer[4];
-static int temp_runaway_error_counter[4];
-#endif
-
 //===========================================================================
 //=============================   functions      ============================
 //===========================================================================
 
-  void PID_autotune(float temp, int extruder, int ncycles)
-  {
-  pid_number_of_cycles = ncycles;
-  pid_tuning_finished = false;
+void PID_autotune(float temp, int extruder, int ncycles)
+{
   float input = 0.0;
-  pid_cycle=0;
+  int cycles=0;
   bool heating = true;
 
   unsigned long temp_millis = millis();
@@ -210,10 +195,8 @@ static int temp_runaway_error_counter[4];
 
   long bias, d;
   float Ku, Tu;
+  float Kp, Ki, Kd;
   float max = 0, min = 10000;
-  uint8_t safety_check_cycles = 0;
-  const uint8_t safety_check_cycles_count = (extruder < 0) ? 45 : 10; //10 cycles / 20s delay for extruder and 45 cycles / 90s for heatbed
-  float temp_ambient;
 
 #if (defined(EXTRUDER_0_AUTO_FAN_PIN) && EXTRUDER_0_AUTO_FAN_PIN > -1) || \
     (defined(EXTRUDER_1_AUTO_FAN_PIN) && EXTRUDER_1_AUTO_FAN_PIN > -1) || \
@@ -227,11 +210,9 @@ static int temp_runaway_error_counter[4];
   #endif
        ){
           SERIAL_ECHOLN("PID Autotune failed. Bad extruder number.");
-		  pid_tuning_finished = true;
-		  pid_cycle = 0;
           return;
         }
-
+	
   SERIAL_ECHOLN("PID Autotune start");
   
   disable_heater(); // switch off all heaters.
@@ -251,6 +232,7 @@ static int temp_runaway_error_counter[4];
 
 
  for(;;) {
+
     if(temp_meas_ready == true) { // temp sample ready
       updateTemperaturesFromRawValues();
 
@@ -285,7 +267,7 @@ static int temp_runaway_error_counter[4];
           heating=true;
           t2=millis();
           t_low=t2 - t1;
-          if(pid_cycle > 0) {
+          if(cycles > 0) {
             bias += (d*(t_high - t_low))/(t_low + t_high);
             bias = constrain(bias, 20 ,(extruder<0?(MAX_BED_POWER):(PID_MAX))-20);
             if(bias > (extruder<0?(MAX_BED_POWER):(PID_MAX))/2) d = (extruder<0?(MAX_BED_POWER):(PID_MAX)) - 1 - bias;
@@ -295,33 +277,33 @@ static int temp_runaway_error_counter[4];
             SERIAL_PROTOCOLPGM(" d: "); SERIAL_PROTOCOL(d);
             SERIAL_PROTOCOLPGM(" min: "); SERIAL_PROTOCOL(min);
             SERIAL_PROTOCOLPGM(" max: "); SERIAL_PROTOCOLLN(max);
-            if(pid_cycle > 2) {
+            if(cycles > 2) {
               Ku = (4.0*d)/(3.14159*(max-min)/2.0);
               Tu = ((float)(t_low + t_high)/1000.0);
               SERIAL_PROTOCOLPGM(" Ku: "); SERIAL_PROTOCOL(Ku);
               SERIAL_PROTOCOLPGM(" Tu: "); SERIAL_PROTOCOLLN(Tu);
-              _Kp = 0.6*Ku;
-              _Ki = 2*_Kp/Tu;
-              _Kd = _Kp*Tu/8;
+              Kp = 0.6*Ku;
+              Ki = 2*Kp/Tu;
+              Kd = Kp*Tu/8;
               SERIAL_PROTOCOLLNPGM(" Classic PID ");
-              SERIAL_PROTOCOLPGM(" Kp: "); SERIAL_PROTOCOLLN(_Kp);
-              SERIAL_PROTOCOLPGM(" Ki: "); SERIAL_PROTOCOLLN(_Ki);
-              SERIAL_PROTOCOLPGM(" Kd: "); SERIAL_PROTOCOLLN(_Kd);
+              SERIAL_PROTOCOLPGM(" Kp: "); SERIAL_PROTOCOLLN(Kp);
+              SERIAL_PROTOCOLPGM(" Ki: "); SERIAL_PROTOCOLLN(Ki);
+              SERIAL_PROTOCOLPGM(" Kd: "); SERIAL_PROTOCOLLN(Kd);
               /*
-              _Kp = 0.33*Ku;
-              _Ki = _Kp/Tu;
-              _Kd = _Kp*Tu/3;
+              Kp = 0.33*Ku;
+              Ki = Kp/Tu;
+              Kd = Kp*Tu/3;
               SERIAL_PROTOCOLLNPGM(" Some overshoot ");
-              SERIAL_PROTOCOLPGM(" Kp: "); SERIAL_PROTOCOLLN(_Kp);
-              SERIAL_PROTOCOLPGM(" Ki: "); SERIAL_PROTOCOLLN(_Ki);
-              SERIAL_PROTOCOLPGM(" Kd: "); SERIAL_PROTOCOLLN(_Kd);
-              _Kp = 0.2*Ku;
-              _Ki = 2*_Kp/Tu;
-              _Kd = _Kp*Tu/3;
+              SERIAL_PROTOCOLPGM(" Kp: "); SERIAL_PROTOCOLLN(Kp);
+              SERIAL_PROTOCOLPGM(" Ki: "); SERIAL_PROTOCOLLN(Ki);
+              SERIAL_PROTOCOLPGM(" Kd: "); SERIAL_PROTOCOLLN(Kd);
+              Kp = 0.2*Ku;
+              Ki = 2*Kp/Tu;
+              Kd = Kp*Tu/3;
               SERIAL_PROTOCOLLNPGM(" No overshoot ");
-              SERIAL_PROTOCOLPGM(" Kp: "); SERIAL_PROTOCOLLN(_Kp);
-              SERIAL_PROTOCOLPGM(" Ki: "); SERIAL_PROTOCOLLN(_Ki);
-              SERIAL_PROTOCOLPGM(" Kd: "); SERIAL_PROTOCOLLN(_Kd);
+              SERIAL_PROTOCOLPGM(" Kp: "); SERIAL_PROTOCOLLN(Kp);
+              SERIAL_PROTOCOLPGM(" Ki: "); SERIAL_PROTOCOLLN(Ki);
+              SERIAL_PROTOCOLPGM(" Kd: "); SERIAL_PROTOCOLLN(Kd);
               */
             }
           }
@@ -329,15 +311,13 @@ static int temp_runaway_error_counter[4];
             soft_pwm_bed = (bias + d) >> 1;
           else
             soft_pwm[extruder] = (bias + d) >> 1;
-          pid_cycle++;
+          cycles++;
           min=temp;
         }
       } 
     }
     if(input > (temp + 20)) {
       SERIAL_PROTOCOLLNPGM("PID Autotune failed! Temperature too high");
-	  pid_tuning_finished = true;
-	  pid_cycle = 0;
       return;
     }
     if(millis() - temp_millis > 2000) {
@@ -346,46 +326,22 @@ static int temp_runaway_error_counter[4];
         p=soft_pwm_bed;       
         SERIAL_PROTOCOLPGM("ok B:");
       }else{
-        p=soft_pwm[extruder]; 		
-		SERIAL_PROTOCOLPGM("ok T:");
+        p=soft_pwm[extruder];       
+        SERIAL_PROTOCOLPGM("ok T:");
       }
-		SERIAL_PROTOCOL(input);   
-		SERIAL_PROTOCOLPGM(" @:");
-		SERIAL_PROTOCOLLN(p);       
-		if (safety_check_cycles == 0) { //save ambient temp
-			temp_ambient = input;
-			//SERIAL_ECHOPGM("Ambient T: ");
-			//MYSERIAL.println(temp_ambient);
-			safety_check_cycles++;
-		}
-		else if (safety_check_cycles < safety_check_cycles_count) { //delay
-			safety_check_cycles++;		
-		}
-		else if (safety_check_cycles == safety_check_cycles_count){ //check that temperature is rising
-			safety_check_cycles++;
-			//SERIAL_ECHOPGM("Time from beginning: ");
-			//MYSERIAL.print(safety_check_cycles_count * 2);
-			//SERIAL_ECHOPGM("s. Difference between current and ambient T: ");
-			//MYSERIAL.println(input - temp_ambient);
+			
+      SERIAL_PROTOCOL(input);   
+      SERIAL_PROTOCOLPGM(" @:");
+      SERIAL_PROTOCOLLN(p);       
 
-			if (abs(input - temp_ambient) < 5.0) { 
-				temp_runaway_stop(false, (extruder<0));
-				pid_tuning_finished = true;
-				return;
-			}
-		}
       temp_millis = millis();
     }
     if(((millis() - t1) + (millis() - t2)) > (10L*60L*1000L*2L)) {
       SERIAL_PROTOCOLLNPGM("PID Autotune failed! timeout");
-	  pid_tuning_finished = true;
-	  pid_cycle = 0;
       return;
     }
-    if(pid_cycle > ncycles) {
+    if(cycles > ncycles) {
       SERIAL_PROTOCOLLNPGM("PID Autotune finished! Put the last Kp, Ki and Kd constants from above into Configuration.h");
-	  pid_tuning_finished = true;
-	  pid_cycle = 0;
       return;
     }
     lcd_update();
@@ -716,7 +672,6 @@ void manage_heater()
 		    	 volumetric_multiplier[FILAMENT_SENSOR_EXTRUDER_NUM]=0.01;
 	}
 #endif
-  host_keepalive();
 }
 
 #define PGM_RD_W(x)   (short)pgm_read_word(&x)
@@ -1101,11 +1056,12 @@ void temp_runaway_check(int _heater_id, float _target_temperature, float _curren
 	float __hysteresis = 0;
 	int __timeout = 0;
 	bool temp_runaway_check_active = false;
-	static float __preheat_start[2] = { 0,0}; //currently just bed and one extruder
-	static int __preheat_counter[2] = { 0,0};
-	static int __preheat_errors[2] = { 0,0};
-		
-	
+	static float __preheat_start = 0;
+	static int __preheat_counter = 0;
+	static int __preheat_errors = 0;
+
+	_heater_id = (_isbed) ? _heater_id++ : _heater_id;
+
 #ifdef 	TEMP_RUNAWAY_BED_TIMEOUT
 	if (_isbed)
 	{
@@ -1137,8 +1093,8 @@ void temp_runaway_check(int _heater_id, float _target_temperature, float _curren
 			{
 				temp_runaway_status[_heater_id] = TempRunaway_PREHEAT;
 				temp_runaway_target[_heater_id] = _target_temperature;
-				__preheat_start[_heater_id] = _current_temperature;
-				__preheat_counter[_heater_id] = 0;
+				__preheat_start = _current_temperature;
+				__preheat_counter = 0;
 			}
 			else
 			{
@@ -1149,39 +1105,26 @@ void temp_runaway_check(int _heater_id, float _target_temperature, float _curren
 
 		if (temp_runaway_status[_heater_id] == TempRunaway_PREHEAT)
 		{
-			if (_current_temperature < ((_isbed) ? (0.8 * _target_temperature) : 150)) //check only in area where temperature is changing fastly for heater, check to 0.8 x target temperature for bed
+			if (_current_temperature < 150)
 			{
-				__preheat_counter[_heater_id]++;
-				//SERIAL_ECHOPGM("counter[0]:");  MYSERIAL.println(__preheat_counter[0]);
-				//SERIAL_ECHOPGM("counter[1]:");  MYSERIAL.println(__preheat_counter[1]);
-				//SERIAL_ECHOPGM("_isbed"); MYSERIAL.println(_isbed);
-				if (__preheat_counter[_heater_id] > ((_isbed) ? 16 : 8)) // periodicaly check if current temperature changes
+				__preheat_counter++;
+				if (__preheat_counter > 8)
 				{
-					/*SERIAL_ECHOLNPGM("Heater:");
-					MYSERIAL.print(_heater_id);
-					SERIAL_ECHOPGM(" Current temperature:");
-					MYSERIAL.print(_current_temperature);
-					SERIAL_ECHOPGM(" Tstart:");
-					MYSERIAL.print(__preheat_start[_heater_id]);*/
-					
-					if (_current_temperature - __preheat_start[_heater_id] < 2) {
-						__preheat_errors[_heater_id]++;
-						/*SERIAL_ECHOPGM(" Preheat errors:");
-						MYSERIAL.println(__preheat_errors[_heater_id]);*/
+					if (_current_temperature - __preheat_start < 2) {
+						__preheat_errors++;
 					}
 					else {
-						//SERIAL_ECHOLNPGM("");
-						__preheat_errors[_heater_id] = 0;
+						__preheat_errors = 0;
 					}
 
-					if (__preheat_errors[_heater_id] > ((_isbed) ? 2 : 5)) 
+					if (__preheat_errors > 5)
 					{
 						if (farm_mode) { prusa_statistics(0); }
-						temp_runaway_stop(true, _isbed);
+						temp_runaway_stop(true);
 						if (farm_mode) { prusa_statistics(91); }
 					}
-					__preheat_start[_heater_id] = _current_temperature;
-					__preheat_counter[_heater_id] = 0;
+					__preheat_start = _current_temperature;
+					__preheat_counter = 0;
 				}
 			}
 		}
@@ -1199,7 +1142,7 @@ void temp_runaway_check(int _heater_id, float _target_temperature, float _curren
 
 
 		if (temp_runaway_check_active)
-		{			
+		{
 			//	we are in range
 			if (_target_temperature - __hysteresis < _current_temperature && _current_temperature < _target_temperature + __hysteresis)
 			{
@@ -1214,7 +1157,7 @@ void temp_runaway_check(int _heater_id, float _target_temperature, float _curren
 					if (temp_runaway_error_counter[_heater_id] * 2 > __timeout)
 					{
 						if (farm_mode) { prusa_statistics(0); }
-						temp_runaway_stop(false, _isbed);
+						temp_runaway_stop(false);
 						if (farm_mode) { prusa_statistics(90); }
 					}
 				}
@@ -1224,7 +1167,7 @@ void temp_runaway_check(int _heater_id, float _target_temperature, float _curren
 	}
 }
 
-void temp_runaway_stop(bool isPreheat, bool isBed)
+void temp_runaway_stop(bool isPreheat)
 {
 	cancel_heatup = true;
 	quickStop();
@@ -1250,9 +1193,9 @@ void temp_runaway_stop(bool isPreheat, bool isBed)
 	if (isPreheat)
 	{
 		Stop();
-		isBed ? LCD_ALERTMESSAGEPGM("BED PREHEAT ERROR") : LCD_ALERTMESSAGEPGM("PREHEAT ERROR");
+		LCD_ALERTMESSAGEPGM("   PREHEAT ERROR");
 		SERIAL_ERROR_START;
-		isBed ? SERIAL_ERRORLNPGM(" THERMAL RUNAWAY ( PREHEAT HEATBED)") : SERIAL_ERRORLNPGM(" THERMAL RUNAWAY ( PREHEAT HOTEND)");
+		SERIAL_ERRORLNPGM(": THERMAL RUNAWAY ( PREHEAT )");
 		SET_OUTPUT(EXTRUDER_0_AUTO_FAN_PIN);
 		SET_OUTPUT(FAN_PIN);
 		WRITE(EXTRUDER_0_AUTO_FAN_PIN, 1);
@@ -1262,9 +1205,9 @@ void temp_runaway_stop(bool isPreheat, bool isBed)
 	}
 	else
 	{
-		isBed ? LCD_ALERTMESSAGEPGM("BED THERMAL RUNAWAY") : LCD_ALERTMESSAGEPGM("THERMAL RUNAWAY");
+		LCD_ALERTMESSAGEPGM("THERMAL RUNAWAY");
 		SERIAL_ERROR_START;
-		isBed ? SERIAL_ERRORLNPGM(" HEATBED THERMAL RUNAWAY") : SERIAL_ERRORLNPGM(" HOTEND THERMAL RUNAWAY");
+		SERIAL_ERRORLNPGM(": THERMAL RUNAWAY");
 	}
 }
 #endif
@@ -1334,9 +1277,6 @@ void max_temp_error(uint8_t e) {
 }
 
 void min_temp_error(uint8_t e) {
-#ifdef DEBUG_DISABLE_MINTEMP
-	return;
-#endif
   disable_heater();
   if(IsStopped() == false) {
     SERIAL_ERROR_START;
@@ -1367,9 +1307,6 @@ void bed_max_temp_error(void) {
 }
 
 void bed_min_temp_error(void) {
-#ifdef DEBUG_DISABLE_MINTEMP
-	return;
-#endif
 #if HEATER_BED_PIN > -1
     WRITE(HEATER_BED_PIN, 0);
 #endif
@@ -1447,9 +1384,7 @@ ISR(TIMER0_COMPB_vect)
   static unsigned char temp_count = 0;
   static unsigned long raw_temp_0_value = 0;
   static unsigned long raw_temp_1_value = 0;
-#if defined(TEMP_2_PIN) && (TEMP_2_PIN > -1)
   static unsigned long raw_temp_2_value = 0;
-#endif
   static unsigned long raw_temp_bed_value = 0;
   static unsigned char temp_state = 10;
   static unsigned char pwm_count = (1 << SOFT_PWM_SCALE);
@@ -1889,7 +1824,7 @@ ISR(TIMER0_COMPB_vect)
 #ifdef TEMP_SENSOR_1_AS_REDUNDANT
       redundant_temperature_raw = raw_temp_1_value;
 #endif
-#if (EXTRUDERS > 2) && defined(TEMP_2_PIN) && (TEMP_2_PIN > -1)
+#if EXTRUDERS > 2
       current_temperature_raw[2] = raw_temp_2_value;
 #endif
       current_temperature_bed_raw = raw_temp_bed_value;
@@ -1905,9 +1840,7 @@ ISR(TIMER0_COMPB_vect)
     temp_count = 0;
     raw_temp_0_value = 0;
     raw_temp_1_value = 0;
-#if defined(TEMP_2_PIN) && (TEMP_2_PIN > -1)
     raw_temp_2_value = 0;
-#endif
     raw_temp_bed_value = 0;
 
 #if HEATER_0_RAW_LO_TEMP > HEATER_0_RAW_HI_TEMP

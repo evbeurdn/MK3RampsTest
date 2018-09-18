@@ -43,13 +43,7 @@ void _EEPROM_readData(int &pos, uint8_t* value, uint8_t size)
 // wrong data being written to the variables.
 // ALSO:  always make sure the variables in the Store and retrieve sections are in the same order.
 
-#ifdef SNMM
-	#define EEPROM_VERSION "M1"
-#else
-	#define EEPROM_VERSION "V1"
-#endif 
-
-
+#define EEPROM_VERSION "V0"
 
 #ifdef EEPROM_SETTINGS
 void Config_StoreSettings() 
@@ -97,11 +91,6 @@ void Config_StoreSettings()
     EEPROM_WRITE_VAR(i,dummy);
     EEPROM_WRITE_VAR(i,dummy);
   #endif
-  #ifdef PIDTEMPBED
-	EEPROM_WRITE_VAR(i, bedKp);
-	EEPROM_WRITE_VAR(i, bedKi);
-	EEPROM_WRITE_VAR(i, bedKd);
-  #endif
   #ifndef DOGLCD
     int lcd_contrast = 32;
   #endif
@@ -130,6 +119,7 @@ void Config_StoreSettings()
   EEPROM_WRITE_VAR(i, filament_size[2]);
   #endif
   #endif
+  
   /*MYSERIAL.print("Top address used:\n");
   MYSERIAL.print(i);
   MYSERIAL.print("\n");
@@ -207,15 +197,6 @@ void Config_PrintSettings()
     SERIAL_ECHOPAIR(" D" ,unscalePID_d(Kd));
     SERIAL_ECHOLN(""); 
 #endif
-#ifdef PIDTEMPBED
-	SERIAL_ECHO_START;
-	SERIAL_ECHOLNPGM("PID heatbed settings:");
-	SERIAL_ECHO_START;
-	SERIAL_ECHOPAIR("   M304 P", bedKp);
-	SERIAL_ECHOPAIR(" I", unscalePID_i(bedKi));
-	SERIAL_ECHOPAIR(" D", unscalePID_d(bedKd));
-	SERIAL_ECHOLN("");
-#endif
 #ifdef FWRETRACT
     SERIAL_ECHO_START;
     SERIAL_ECHOLNPGM("Retract: S=Length (mm) F:Speed (mm/m) Z: ZLift (mm)");
@@ -270,15 +251,13 @@ void Config_PrintSettings()
 
 
 #ifdef EEPROM_SETTINGS
-bool Config_RetrieveSettings()
+void Config_RetrieveSettings()
 {
     int i=EEPROM_OFFSET;
-	bool previous_settings_retrieved = true; 
     char stored_ver[4];
     char ver[4]=EEPROM_VERSION;
     EEPROM_READ_VAR(i,stored_ver); //read stored version
-
-	//  SERIAL_ECHOLN("Version: [" << ver << "] Stored version: [" << stored_ver << "]");
+    //  SERIAL_ECHOLN("Version: [" << ver << "] Stored version: [" << stored_ver << "]");
     if (strncmp(ver,stored_ver,3) == 0)
     {
         // version number match
@@ -322,12 +301,7 @@ bool Config_RetrieveSettings()
         EEPROM_READ_VAR(i,Kp);
         EEPROM_READ_VAR(i,Ki);
         EEPROM_READ_VAR(i,Kd);
-		#ifdef PIDTEMPBED
-		EEPROM_READ_VAR(i, bedKp);
-		EEPROM_READ_VAR(i, bedKi);
-		EEPROM_READ_VAR(i, bedKd);
-		#endif
-		#ifndef DOGLCD
+        #ifndef DOGLCD
         int lcd_contrast;
         #endif
         EEPROM_READ_VAR(i,lcd_contrast);
@@ -358,26 +332,16 @@ bool Config_RetrieveSettings()
 		calculate_volumetric_multipliers();
 		// Call updatePID (similar to when we have processed M301)
 		updatePID();
-
-		SERIAL_ECHO_START;
+        SERIAL_ECHO_START;
         SERIAL_ECHOLNPGM("Stored settings retrieved");
     }
     else
     {
         Config_ResetDefault();
-
-		//Return false to inform user that eeprom version was changed and firmware is using default hardcoded settings now.
-		//In case that storing to eeprom was not used yet, do not inform user that hardcoded settings are used.
-		if (eeprom_read_byte((uint8_t *)EEPROM_OFFSET) != 0xFF ||
-			eeprom_read_byte((uint8_t *)EEPROM_OFFSET + 1) != 0xFF ||
-			eeprom_read_byte((uint8_t *)EEPROM_OFFSET + 2) != 0xFF) {
-			previous_settings_retrieved = false;
-		}
     }
     #ifdef EEPROM_CHITCHAT
       Config_PrintSettings();
     #endif
-	  return previous_settings_retrieved;
 }
 #endif
 
